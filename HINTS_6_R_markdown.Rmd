@@ -1,0 +1,274 @@
+---
+title: "Analyzing HINTS 6 data using R"
+author: "Jacob Rohde"
+date: '2024-09-05'
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading required libraries and data into R
+
+```{r load packages, message = FALSE, warning = FALSE, results = 'hide'}
+library(haven) # For loading data from SAS, SPSS, or STATA into R
+library(dplyr) # For data manipulation
+library(survey) # For analyzing complex survey data
+library(srvyr) # For manipulating survey objects with dplyr
+library(broom) # For presenting tidy data tables
+library(rstudioapi) # For setting a working directory
+
+# Setting the working directory to file location
+setwd(dirname(getActiveDocumentContext()$path))
+
+# Load data
+df = haven::read_sas("hints6_public.sas7bdat") 
+
+```
+
+# Recoding survey variables
+
+The code chunk below shows an example of how to use 'dplyr' to create new variables or recode existing ones.
+
+```{r re-coding data}
+df = df |>
+  dplyr::mutate(gender = case_match(factor(BirthGender),
+                                    '1' ~ 'Male',
+                                    '2' ~ 'Female')) |>
+  
+  dplyr::mutate(edu = case_match(factor(Education),
+                                 c('1', '2') ~ 'Less than high school',
+                                 '3' ~ '12 years or completed high school',
+                                 c('4', '5') ~ 'Some college',
+                                 c('6', '7') ~ 'College graduate or higher')) |>
+  
+  dplyr::mutate(SeekCancerInfo = case_match(SeekCancerInfo,
+                                             1 ~ 1,
+                                             2 ~ 0))
+
+# Setting the reference level for categorical variables
+df$gender = relevel(factor(df$gender, ordered = F), 
+                    ref = 'Male')
+
+df$edu = relevel(factor(df$edu, ordered = F), 
+                 ref = 'Less than high school')
+
+```
+
+# Example analytic procedures using a replicate weights approach
+
+The code chunk below creates a survey design object to account for replicate weights when running statistical analyses.
+
+```{r replicate weights design object}
+svy_obj_rep = as_survey_rep(.data = df,
+                            weights = PERSON_FINWT0,
+                            repweights = num_range(prefix = "PERSON_FINWT", 
+                                                   range = 1:50),
+                            type = "JKn", 
+                            scale = 0.98, 
+                            rscales = rep(1, times = 50))
+```
+
+**Computing a crosstab and chi-square test:**
+
+```{r replicate weights crosstab and chi-square}
+# Crosstab
+svy_obj_rep |>
+  dplyr::filter(is.na(edu) == F, 
+                is.na(gender) == F) |>
+  dplyr::group_by(edu, gender) |>
+  dplyr::summarize(n = n(),
+                   total = survey_total(),
+                   pct = survey_prop()) 
+
+# Chi-square test
+svy_obj_rep |>
+  svychisq(formula = ~ gender + edu,
+           statistic = "F")
+```
+
+**Computing a logistic regression:**
+
+```{r replicate weights logistic regression}
+logistic_model = svy_obj_rep |>
+  svyglm(formula = SeekCancerInfo ~ edu + gender,
+         family = quasibinomial()) 
+
+# For displaying general summary statistics 
+summary(logistic_model) 
+
+# For displaying odds ratios and 95% confidence intervals
+tidy(logistic_model, 
+     conf.int = T, 
+     conf.level = 0.95, 
+     exponentiate = T) 
+```
+
+**Computing a linear regression:**
+
+```{r replicate weights linear regression}
+linear_model = svy_obj_rep |>
+  svyglm(formula = GeneralHealth ~ edu + gender,
+         family = gaussian()) 
+
+summary(linear_model)
+```
+
+# Example analytic procedures using a Taylor Series linearization approach
+
+The code chunk below creates a survey design object to account for Taylor Series linearization sample weights when running statistical analyses.
+
+```{r TS design object}
+svy_obj_linear = as_survey_design(.data = df,
+                                  ids = VAR_CLUSTER,
+                                  strata = VAR_STRATUM,
+                                  weights = PERSON_FINWT0,
+                                  nest = T)
+```
+
+**Computing a crosstab and chi-square test:**
+
+```{r TS crosstab and chi-square}
+# Crosstab
+svy_obj_linear |>
+  dplyr::filter(is.na(edu) == F, 
+                is.na(gender) == F) |>
+  dplyr::group_by(edu, gender) |>
+  dplyr::summarize(n = n(),
+                   total = survey_total(),
+                   pct = survey_prop()) 
+
+# Chi-square test
+svy_obj_linear |>
+  svychisq(formula = ~ gender + edu,
+           statistic = "F")
+```
+
+**Computing a logistic regression:**
+
+```{r TS logistic regression}
+logistic_model = svy_obj_linear |>
+  svyglm(formula = SeekCancerInfo ~ edu + gender,
+         family = quasibinomial()) 
+
+# For displaying general summary statistics 
+summary(logistic_model)  
+
+# For displaying odds ratios and 95% confidence intervals
+tidy(logistic_model, 
+     conf.int = T, 
+     conf.level = 0.95, 
+     exponentiate = T) 
+```
+
+**Computing a linear regression:**
+
+```{r TS linear regression}
+linear_model = svy_obj_linear |>
+  svyglm(formula = GeneralHealth ~ edu + gender,
+         family = gaussian()) 
+
+summary(linear_model)
+```
+
+# Combining HINTS 5 Cycle 4 data with HINTS 6
+
+The code chunk below loads HINTS 6 and HINTS 5 Cycle 4 SAS files into R as separate data objects (make sure both files are in the same working directory).
+
+```{r loading H6 and H5C4 data}
+# HINTS 6 file
+df_H6 = haven::read_sas("hints6_public.sas7bdat")
+
+# HINTS 5 Cycle 4 file
+df_H5C4 = haven::read_sas("hints5_cycle4_public.sas7bdat")
+```
+
+**Create new sample weights and merge the two data sets:**
+
+```{r merging H6 and H5C4}
+
+# Create variable names
+nwgt_var_names = c(paste0('nwgt', 1:100))
+var_names = c(paste0('PERSON_FINWT', 1:50))
+
+# Create Hints 5 Cycle 4 group weights
+df_H5C4 = df_H5C4 |>
+  dplyr::mutate(hints_edition = 'Hints 5 Cycle 4') |>
+  dplyr::mutate(nwgt0 = PERSON_FINWT0)
+
+for(i in 1:100){
+  if(i <= 50){
+    df_H5C4[nwgt_var_names[i]] = df_H5C4[var_names[i]]
+  }
+  
+  if(i > 50){
+    df_H5C4[nwgt_var_names[i]] = df_H5C4$PERSON_FINWT0
+  }
+}
+
+# Create Hints 6 group weights
+df_H6 = df_H6 |>
+  dplyr::mutate(hints_edition = 'HINTS 6') |> 
+  dplyr::mutate(nwgt0 = PERSON_FINWT0)
+
+for(i in 1:100){
+  if(i <= 50){
+    df_H6[nwgt_var_names[i]] = df_H6$PERSON_FINWT0
+  }
+  
+  if(i > 50){
+    df_H6[nwgt_var_names[i]] = df_H6[var_names[i-50]]
+  }
+}
+
+# Merge the data sets
+df_multi = plyr::rbind.fill(df_H5C4, df_H6)
+
+# Display number of respondents from both survey editions
+table(df_multi$hints_edition)
+```
+
+The example code below can be used to run simple frequencies on two common variables ("SeekCancerInfo" and "ChanceAskQuestions") in the HINTS 6 and HINTS 5 Cycle 4 merged data set using a replicate weights approach:
+
+```{r merged replicate weights design object, results = 'hide'}
+# Create the replicate weights survey design object
+svy_obj_rep_merged = as_survey_rep(.data = df_multi,
+                                   weights = nwgt0,
+                                   repweights = num_range(prefix = "nwgt", 
+                                                          range = 1:100),
+                                   type = "JKn", 
+                                   scale = 0.98, 
+                                   rscales = rep(1, times = 100))
+
+# Crosstab 
+svy_obj_rep_merged |>
+  dplyr::filter(ChanceAskQuestions > 0, 
+                SeekCancerInfo > 0) |>
+  dplyr::group_by(ChanceAskQuestions, SeekCancerInfo) |>
+  dplyr::summarize(n = n(),
+                   total = survey_total(),
+                   pct = survey_prop()) 
+```
+
+The example code below can be used to run simple frequencies on two common variables ("SeekCancerInfo" and "ChanceAskQuestions") in the HINTS 6 and HINTS 5 Cycle 4 merged data set using a Taylor Series linearization approach:
+
+```{r merged TS weights design object, results = 'hide'}
+# Create the Taylor Series linearization survey design object
+svy_obj_linear_merged = as_survey_design(.data = df_multi,
+                                         ids = VAR_CLUSTER,
+                                         strata = VAR_STRATUM,
+                                         weights = PERSON_FINWT0,
+                                         nest = T)
+
+# Crosstab 
+svy_obj_linear_merged |>
+  dplyr::filter(ChanceAskQuestions > 0, 
+                SeekCancerInfo > 0) |>
+  dplyr::group_by(ChanceAskQuestions, SeekCancerInfo) |>
+  dplyr::summarize(n = n(),
+                   total = survey_total(),
+                   pct = survey_prop()) 
+```
